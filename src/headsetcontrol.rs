@@ -108,6 +108,8 @@ pub fn scan(exe: &Path, skip_pid: impl Fn(u16) -> bool) -> Vec<Observation> {
                 }),
                 name: Some(name),
                 state,
+                direct: None,
+                aliases: vec![],
             })
         })
         .collect()

@@ -46,7 +46,24 @@ pub fn scan() -> Vec<Observation> {
     let mut out = Vec::new();
     scan_ble(&mut out);
     scan_classic(&mut out);
+    dedupe_by_mac(&mut out);
     out
+}
+
+/// A dual-mode device paired over both BLE and classic shows up twice — once as
+/// `ble:<mac>` (live GATT read) and once as `bt:<mac>` (Windows' stored level).
+/// Keep the BLE reading: it's fresher. The tracker's aliases would merge the
+/// two rows anyway — this is an optimization that avoids a redundant row for a
+/// scan, not the correctness mechanism.
+fn dedupe_by_mac(out: &mut Vec<Observation>) {
+    let ble_macs: HashSet<u64> = out
+        .iter()
+        .filter_map(|o| o.id.strip_prefix("ble:").and_then(|m| u64::from_str_radix(m, 16).ok()))
+        .collect();
+    out.retain(|o| match o.id.strip_prefix("bt:") {
+        Some(mac) => u64::from_str_radix(mac, 16).map_or(true, |m| !ble_macs.contains(&m)),
+        None => true,
+    });
 }
 
 /// Paired LE devices are found through SetupAPI rather than a WinRT device query: the query
@@ -128,12 +145,16 @@ fn read_ble(dev: &BluetoothLEDevice) -> windows::core::Result<Result<Observation
         return skip("Xbox controller, reported by the Xbox source"); // more precise there
     }
     // Not the name: users rename Bluetooth devices.
-    diag::event(&format!("ble#{}", diag::bt_tag(dev.BluetoothAddress()?)), format!("appearance 0x{appearance:04X}: battery via GATT"));
+    let addr = dev.BluetoothAddress()?;
+    diag::event(&format!("ble#{}", diag::bt_tag(addr)), format!("appearance 0x{appearance:04X}: battery via GATT"));
     Ok(Ok(Observation {
-        id: format!("ble:{:012x}", dev.BluetoothAddress()?),
+        id: format!("ble:{addr:012x}"),
+        // Same device over classic Bluetooth reports the same address as bt:.
+        aliases: vec![format!("bt:{addr:012x}")],
         kind: kind.or_else(|| Some(Kind::from_name(&name))),
         name: Some(name),
         state: State::Battery { percent: percent.min(100), charging: false },
+        direct: None,
     }))
 }
 
@@ -201,10 +222,13 @@ fn scan_classic(out: &mut Vec<Observation>) {
         );
         out.push(Observation {
             id: format!("bt:{addr:012x}"),
+            // Same device over BLE reports the same address as ble:.
+            aliases: vec![format!("ble:{addr:012x}")],
             // Paired-but-disconnected devices keep a stale level; only add them once seen connected.
             name: (connected && !name.is_empty()).then_some(name),
             kind: Some(kind),
             state: if connected { State::Battery { percent: percent.min(100), charging: false } } else { State::Off },
+            direct: None,
         });
     }
     // The usual "my headphones don't show up" case: Windows never got a level from them.
@@ -282,6 +306,20 @@ fn address_from_instance_id(id: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ble_and_classic_same_mac_dedupes() {
+        let o = |id: &str, state| Observation { id: id.into(), name: Some("h".into()), kind: Some(Kind::Headset), state, direct: None, aliases: vec![] };
+        let mut out = vec![
+            o("bt:f4ee25fbba46", State::Battery { percent: 50, charging: false }),
+            o("ble:f4ee25fbba46", State::Battery { percent: 51, charging: false }),
+            o("bt:001122334455", State::Battery { percent: 60, charging: false }),
+        ];
+        dedupe_by_mac(&mut out);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().any(|o| o.id == "ble:f4ee25fbba46"));
+        assert!(out.iter().any(|o| o.id == "bt:001122334455"));
+    }
 
     #[test]
     fn parses_addresses() {

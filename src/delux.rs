@@ -85,6 +85,8 @@ impl Delux {
             name: Some("Wireless mouse".into()),
             kind: Some(Kind::Mouse),
             state,
+            direct: Some(false),
+            aliases: vec![],
         }]
     }
 }

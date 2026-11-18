@@ -178,9 +178,11 @@ fn demo_readings() -> Vec<Reading> {
     let warn_only = DEMO.load(std::sync::atomic::Ordering::Relaxed) == 2;
     let r = |name: &str, kind, percent, charging, stale| Reading {
         id: name.into(),
+        ids: vec![name.into()],
         name: name.into(),
         kind,
         status: Status::Battery { percent, charging, stale },
+        direct: None,
     };
     vec![
         r("Headset", crate::device::Kind::Headset, 64, true, false),
@@ -219,7 +221,7 @@ fn worker(controller: usize, rx: Receiver<()>) {
         obs.extend(delux.scan(&api));
         obs.extend(xbox::scan());
         obs.extend(mchose::scan(&api));
-        if forced || last_bt.is_none_or(|t| t.elapsed() >= POLL_BLUETOOTH) {
+        if forced || last_bt.map_or(true, |t| t.elapsed() >= POLL_BLUETOOTH) {
             bt = bluetooth::scan();
             if let Some(exe) = headsetcontrol::find() {
                 bt.extend(headsetcontrol::scan(&exe, |pid| logitech::reports_pid(&obs, pid)));
@@ -295,7 +297,7 @@ unsafe fn show_menu(hwnd: HWND) {
 
     for (i, r) in devices.iter().enumerate() {
         let label = wide(&format!("{}  —  {}", r.name, r.status));
-        let check = if hidden.contains(&r.id) { MF_UNCHECKED } else { MF_CHECKED };
+        let check = if r.is_hidden(&hidden) { MF_UNCHECKED } else { MF_CHECKED };
         AppendMenuW(menu, MF_STRING | check, CMD_DEVICE_BASE + i, label.as_ptr());
         labels.push(label);
     }
@@ -346,7 +348,7 @@ unsafe fn show_menu(hwnd: HWND) {
         }
         c if c >= CMD_DEVICE_BASE => {
             if let Some(r) = devices.get(c - CMD_DEVICE_BASE) {
-                settings::toggle_hidden(&r.id);
+                settings::toggle_hidden(&r.ids);
                 update();
             }
         }

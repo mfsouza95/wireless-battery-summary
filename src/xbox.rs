@@ -49,6 +49,8 @@ fn scan_gamepads() -> windows::core::Result<Vec<Observation>> {
             name: Some(if name.is_empty() { "Xbox controller".to_string() } else { name }),
             kind: Some(Kind::Gamepad),
             state: State::Battery { percent, charging: status == BatteryStatus::Charging },
+            direct: None,
+            aliases: vec![],
         });
     }
     Ok(out)

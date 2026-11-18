@@ -33,7 +33,6 @@ pub const WM_APP_TRAY: u32 = WM_APP + 3;
 // NOTIFYICON_VERSION_4 events arrive in LOWORD(lParam).
 pub const NIN_SELECT: u32 = 0x400;
 pub const NIN_KEYSELECT: u32 = 0x401;
-pub const NIN_POPUPOPEN: u32 = 0x406;
 
 /// Any visible, non-charging device at or below this level adds the warning badge.
 pub const WARN_PCT: u8 = 20;
@@ -72,14 +71,14 @@ impl Warnings {
         let mut worst: Option<(u8, Kind)> = None;
         let mut low = 0u8;
         for r in readings {
-            if hidden.contains(&r.id) {
+            if r.is_hidden(hidden) {
                 continue;
             }
             if let Status::Battery { percent, charging: false, .. } = r.status {
                 if percent <= warn_ceiling {
                     low += 1;
                 }
-                if worst.is_none_or(|(p, _)| percent < p) {
+                if worst.map_or(true, |(p, _)| percent < p) {
                     worst = Some((percent, r.kind));
                 }
             }
@@ -142,7 +141,7 @@ pub unsafe fn icon_rect() -> Option<RECT> {
 pub fn tooltip(readings: &[Reading], hidden: &[String]) -> Vec<u16> {
     let text = readings
         .iter()
-        .filter(|r| !hidden.contains(&r.id))
+        .filter(|r| !r.is_hidden(hidden))
         .map(|r| format!("{} · {}", r.name, r.status))
         .collect::<Vec<_>>()
         .join("  |  ");
@@ -276,7 +275,7 @@ mod tests {
     use super::*;
 
     fn r(kind: Kind, percent: u8, charging: bool, stale: bool) -> Reading {
-        Reading { id: percent.to_string(), name: "dev".into(), kind, status: Status::Battery { percent, charging, stale } }
+        Reading { id: percent.to_string(), ids: vec![percent.to_string()], name: "dev".into(), kind, status: Status::Battery { percent, charging, stale }, direct: None }
     }
 
     #[test]

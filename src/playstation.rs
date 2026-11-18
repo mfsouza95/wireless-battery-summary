@@ -47,16 +47,14 @@ pub fn scan(api: &HidApi) -> Vec<Observation> {
                 continue;
             }
         };
-        let (percent, charging) = match read_status(&dev, dualsense) {
-            Ok((percent, charging, report)) => {
-                diag::event(&key, format!("battery via input report 0x{report:02X}"));
-                (percent, charging)
-            }
+        let (percent, charging, report) = match read_status(&dev, dualsense) {
+            Ok(v) => v,
             Err(why) => {
                 diag::event(&key, why);
                 continue;
             }
         };
+        diag::event(&key, format!("battery via input report 0x{report:02X}"));
 
         let name = match pid {
             DUALSENSE_EDGE => "DualSense Edge",
@@ -70,6 +68,10 @@ pub fn scan(api: &HidApi) -> Vec<Observation> {
             name: Some(name.to_string()),
             kind: Some(Kind::Gamepad),
             state: State::Battery { percent, charging },
+            // Report 0x01 only arrives over USB; the Bluetooth reports are
+            // 0x31 (DualSense) and 0x11 (DualShock 4).
+            direct: Some(report == 0x01),
+            aliases: vec![],
         });
     }
     out

@@ -166,7 +166,7 @@ pub unsafe fn refresh(hwnd: HWND) {
 /// is the one place they're still listed (greyed out).
 fn rows() -> Vec<Reading> {
     let hidden = settings::hidden_devices();
-    crate::widget::readings().into_iter().filter(|r| !hidden.contains(&r.id)).collect()
+    crate::widget::readings().into_iter().filter(|r| !r.is_hidden(&hidden)).collect()
 }
 
 /// Paints the whole window (double buffered).

@@ -77,6 +77,8 @@ pub fn scan(api: &HidApi) -> Vec<Observation> {
             name: Some(if name.is_empty() { "MCHOSE headset".into() } else { name }),
             kind: Some(Kind::Headset),
             state,
+            direct: Some(false),
+            aliases: vec![],
         });
     }
     out

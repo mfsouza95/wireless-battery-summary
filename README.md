@@ -106,14 +106,18 @@ Warnings clear a couple of points above their threshold (22% / 12%) so the icon 
 
 **Hover** the icon for a one-line summary of every device. **Click** it to open the popup — it slides up from the icon and closes when you click away: one row per device with its icon, name, percentage, and a bar. Devices that are asleep show their last known level, dimmed — the battery doesn't change while a device sleeps. Devices hidden in the menu don't appear.
 
+The same device reachable two ways at once — a charging cable plus its wireless dongle, or BLE plus classic Bluetooth — shows up as one entry.
+
 ### Right-click menu
 
 Right-click the tray icon to see:
 
 - **Every detected device** with its current level, including disconnected ones. Uncheck a device to hide it from the popup, check it again to bring it back.
+- **Display:** tray icon + popup (the default) or the original per-device strip embedded in the taskbar.
 - **Refresh now:** checks all devices immediately.
 - **Low battery alerts:** a Windows notification when a device drops to 15%, sent once per discharge. It re-arms after the device is charged or climbs above 20%. On by default.
 - **Start with Windows:** turn launching at login on or off. It's on by default.
+- **Copy diagnostics:** puts the diagnostics log on the clipboard, for device reports.
 - **Exit**
 
 ### How often it updates
@@ -230,7 +234,7 @@ If `headsetcontrol.exe` (or `headsetcontrol-windows-x86_64.exe`) is next to `tas
 
 - Windows 11 only (Windows 10 is untested).
 - Charging state isn't available for Bluetooth devices, and charging percentages for Logitech voltage-based devices may not match G HUB, which uses separate charging curves.
-- A Logitech device that's switched off keeps showing its last level, because it's indistinguishable from a sleeping one.
+- A Logitech device that's switched off keeps showing its last level, because it's indistinguishable from a sleeping one. If it's actually unpaired from the receiver (in Logi Options+/G HUB), it disappears a couple of minutes later.
 - A Logitech device that's asleep when the app starts is woken once to read it. That can take a check or two (up to ~30 s).
 - PlayStation controller levels come in 10% steps, because that's what the controller reports.
 
@@ -252,7 +256,7 @@ Everything it writes:
 | Location | Purpose |
 |---|---|
 | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` → `TaskbarBattery` | Start with Windows |
-| `HKCU\Software\taskbar-battery` → `AutostartOptOut`, `Hidden`, `LowBatteryAlerts` | Your menu choices |
+| `HKCU\Software\taskbar-battery` → `AutostartOptOut`, `Hidden`, `LowBatteryAlerts`, `DisplayMode` | Your menu choices |
 | `HKCU\Software\Classes\AppUserModelId\TaskbarBattery` | Lets Windows show its notifications |
 | `%LOCALAPPDATA%\taskbar-battery\icon.png` | Icon shown in its notifications |
 | `%LOCALAPPDATA%\taskbar-battery\diagnostics.log` | What each device source found, for support (kept under ~512 KB) |
@@ -308,6 +312,7 @@ src/
 ├── widget.rs          controller window, menu, tooltip, worker thread
 ├── tray.rs            notification icon: states, warning badge, icon rendering
 ├── popup.rs           device list popup window
+├── strip.rs           optional per-device strip embedded in the taskbar
 ├── notify.rs          low-battery notifications
 ├── render.rs          shared glyph table and font helper
 └── settings.rs        registry: start with Windows, hidden devices, alerts, theme

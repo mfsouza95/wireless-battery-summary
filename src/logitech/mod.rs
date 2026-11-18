@@ -23,6 +23,11 @@ const BATTERY_VOLTAGE: u16 = 0x1001;
 const UNIFIED_BATTERY: u16 = 0x1004;
 const ADC_MEASUREMENT: u16 = 0x1F20;
 
+/// Scans a known slot may report unpaired before we believe the device was
+/// really unpaired (~10 fast polls ≈ 2.5 min; a powered-off device comes back
+/// much sooner than that).
+const UNPAIR_GRACE: u8 = 10;
+
 enum Raw {
     /// `feature`: the HID++ battery feature that answered, for diagnostics.
     Percent { percent: u8, charging: bool, feature: u16 },
@@ -42,11 +47,14 @@ struct Identity {
 pub struct Logitech {
     curves: curve::Curves,
     identities: HashMap<String, Identity>,
+    /// Consecutive scans each known slot reported unpaired; past `UNPAIR_GRACE`
+    /// the identity is dropped (the device was really unpaired, not just off).
+    unpaired: HashMap<String, u8>,
 }
 
 impl Logitech {
     pub fn new() -> Self {
-        Self { curves: curve::Curves::load(), identities: HashMap::new() }
+        Self { curves: curve::Curves::load(), identities: HashMap::new(), unpaired: HashMap::new() }
     }
 
     pub fn scan(&mut self, api: &HidApi) -> Vec<Observation> {
@@ -89,13 +97,37 @@ impl Logitech {
             }
         }
         let answered = result.is_ok();
+        if answered {
+            // Anything answered means the slot is paired: reset the unpair count.
+            self.unpaired.remove(&id);
+        }
         let raw = match result {
             Ok(Raw::NoBattery) => {
                 diag::event(&id, "no battery feature (0x1000, 0x1001, 0x1004, 0x1F20)");
                 return None;
             }
             Ok(raw) => raw,
-            Err(Error::Protocol(ERR_UNKNOWN_DEVICE)) if via_receiver => return None, // empty slot
+            Err(Error::Protocol(ERR_UNKNOWN_DEVICE)) if via_receiver => {
+                // Empty slot — unless it's a known device that's powered off,
+                // which the receiver also reports as unpaired. The receiver is
+                // still present, so keep the entry as unreachable for a while;
+                // if the slot stays empty it really was unpaired and the row
+                // should age out instead of haunting the list forever.
+                if !self.identities.contains_key(&id) {
+                    return None;
+                }
+                let miss = self.unpaired.entry(id.clone()).or_default();
+                *miss += 1;
+                if *miss > UNPAIR_GRACE {
+                    self.identities.remove(&id);
+                    self.unpaired.remove(&id);
+                    diag::event(&id, "slot stayed unpaired: forgot device (unpaired?)");
+                    return None;
+                }
+                let known = &self.identities[&id];
+                diag::event(&id, "slot unpaired: device off? (kept as unreachable)");
+                return Some(Observation { id, name: Some(known.name.clone()), kind: Some(known.kind), state: State::Unreachable, direct: Some(false), aliases: vec![] });
+            }
             Err(e) => {
                 if via_receiver {
                     // Paired but not answering (asleep/off). Only meaningful if we know it.
@@ -106,6 +138,8 @@ impl Logitech {
                         name: Some(known.name.clone()),
                         kind: Some(known.kind),
                         state: State::Unreachable,
+                        direct: Some(false),
+                        aliases: vec![],
                     });
                 }
                 // Direct device that doesn't answer: report it only if it looks like a
@@ -160,7 +194,7 @@ impl Logitech {
             }
             Raw::NoBattery => State::Off,
         };
-        Some(Observation { id, name: Some(identity.name), kind: Some(identity.kind), state })
+        Some(Observation { id, name: Some(identity.name), kind: Some(identity.kind), state, direct: Some(!via_receiver), aliases: vec![] })
     }
 }
 
@@ -291,7 +325,7 @@ mod tests {
     }
 
     fn logi() -> Logitech {
-        Logitech { curves: curve::Curves::load(), identities: HashMap::new() }
+        Logitech { curves: curve::Curves::load(), identities: HashMap::new(), unpaired: HashMap::new() }
     }
 
     fn endpoint(pid: u16, product: &str) -> Endpoint {
@@ -377,5 +411,53 @@ mod tests {
     fn empty_receiver_slot_is_skipped() {
         let dev = Fake::new(&[(UNIFIED_BATTERY, 5)]).reply(5, 1, Reply::Protocol(ERR_UNKNOWN_DEVICE));
         assert!(logi().probe(&dev, &endpoint(0xC52B, "USB Receiver"), 2, true).is_none());
+    }
+
+    #[test]
+    fn known_receiver_device_unpaired_stays_unreachable() {
+        // A powered-off Lightspeed device can report its slot as unpaired.
+        // The receiver is still present, so the tracker should keep the last
+        // known device as unreachable rather than dropping it.
+        let id = "logi:c52b:3:02";
+        let mut logi = logi();
+        logi.identities.insert(id.into(), Identity { name: "PRO X 2".into(), kind: Kind::Mouse, pids: vec![] });
+        let dev = Fake::new(&[(UNIFIED_BATTERY, 5)]).reply(5, 1, Reply::Protocol(ERR_UNKNOWN_DEVICE));
+        let o = logi.probe(&dev, &endpoint(0xC52B, "USB Receiver"), 2, true).expect("observed");
+        assert_eq!(o.name.as_deref(), Some("PRO X 2"));
+        assert!(matches!(o.state, State::Unreachable));
+    }
+
+    #[test]
+    fn slot_staying_unpaired_forgets_the_device() {
+        // Powered-off comes back within a few scans; a slot that stays empty for
+        // UNPAIR_GRACE means the device was unpaired — drop the ghost.
+        let id = "logi:c52b:3:02";
+        let mut logi = logi();
+        logi.identities.insert(id.into(), Identity { name: "PRO X 2".into(), kind: Kind::Mouse, pids: vec![] });
+        let dev = Fake::new(&[(UNIFIED_BATTERY, 5)]).reply(5, 1, Reply::Protocol(ERR_UNKNOWN_DEVICE));
+        let ep = endpoint(0xC52B, "USB Receiver");
+        for _ in 0..UNPAIR_GRACE {
+            assert!(logi.probe(&dev, &ep, 2, true).is_some());
+        }
+        assert!(logi.probe(&dev, &ep, 2, true).is_none());
+        assert!(!logi.identities.contains_key(id));
+    }
+
+    #[test]
+    fn answering_resets_the_unpair_count() {
+        let id = "logi:c52b:3:02";
+        let mut logi = logi();
+        logi.identities.insert(id.into(), Identity { name: "PRO X 2".into(), kind: Kind::Mouse, pids: vec![] });
+        let off = Fake::new(&[(UNIFIED_BATTERY, 5)]).reply(5, 1, Reply::Protocol(ERR_UNKNOWN_DEVICE));
+        let on = Fake::new(&[(UNIFIED_BATTERY, 5)]).reply(5, 1, Reply::Ok(vec![80, 0, 0]));
+        let ep = endpoint(0xC52B, "USB Receiver");
+        for _ in 0..UNPAIR_GRACE {
+            logi.probe(&off, &ep, 2, true);
+        }
+        assert!(logi.probe(&on, &ep, 2, true).is_some()); // back from sleep
+        // The count was reset: another UNPAIR_GRACE empty scans still keep it.
+        for _ in 0..UNPAIR_GRACE {
+            assert!(logi.probe(&off, &ep, 2, true).is_some());
+        }
     }
 }

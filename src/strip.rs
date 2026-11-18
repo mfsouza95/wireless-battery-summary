@@ -141,7 +141,7 @@ pub unsafe fn redraw(controller: HWND) {
     // Disconnected devices drop off the bar (they stay listed in the right-click menu).
     let shown: Vec<_> = crate::widget::readings()
         .into_iter()
-        .filter(|r| !hidden.contains(&r.id) && r.status != Status::NotConnected)
+        .filter(|r| !r.is_hidden(&hidden) && r.status != Status::NotConnected)
         .collect();
     let tip = with(|s| s.tooltip);
     if !tip.is_null() {

@@ -101,13 +101,14 @@ pub fn hidden_devices() -> Vec<String> {
     read_string(APP_KEY, "Hidden").map(|s| s.lines().map(str::to_string).collect()).unwrap_or_default()
 }
 
-pub fn toggle_hidden(id: &str) {
+/// Toggles a whole row: every transport id it has been seen under, so the flag
+/// survives merges and transport flips. Any id already hidden unhides them all.
+pub fn toggle_hidden(ids: &[String]) {
     let mut hidden = hidden_devices();
-    match hidden.iter().position(|h| h == id) {
-        Some(i) => {
-            hidden.remove(i);
-        }
-        None => hidden.push(id.to_string()),
+    if ids.iter().any(|id| hidden.contains(id)) {
+        hidden.retain(|h| !ids.contains(h));
+    } else {
+        hidden.extend(ids.iter().cloned());
     }
     let (k, n, data) = (wide(APP_KEY), wide("Hidden"), wide(&hidden.join("\n")));
     unsafe {
