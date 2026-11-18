@@ -4,7 +4,6 @@
 //! HKCU\Software\Classes\AppUserModelId\<id> with a DisplayName.
 
 use crate::device::{Reading, Status};
-use crate::render::LOW_BATTERY;
 use crate::settings;
 use std::collections::HashSet;
 use windows::core::HSTRING;
@@ -12,6 +11,9 @@ use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 
 pub const APP_ID: &str = "TaskbarBattery";
+/// Toast alerts fire at or below this level (the tray icon's warning thresholds
+/// are separate, see tray.rs).
+const LOW_BATTERY: u8 = 15;
 /// Re-arm an alert once the level is back above this (avoids repeats around the threshold).
 const REARM_ABOVE: u8 = LOW_BATTERY + 5;
 

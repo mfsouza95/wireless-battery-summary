@@ -6,10 +6,13 @@ mod device;
 mod diag;
 mod headsetcontrol;
 mod logitech;
+mod mchose;
 mod notify;
 mod playstation;
+mod popup;
 mod render;
 mod settings;
+mod tray;
 mod widget;
 mod xbox;
 
@@ -47,6 +50,7 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(2500));
             obs.extend(delux.scan(&api));
             obs.extend(xbox::scan());
+            obs.extend(mchose::scan(&api));
             obs.extend(bluetooth::scan());
             match headsetcontrol::find() {
                 Some(exe) => {
@@ -60,8 +64,8 @@ fn main() {
                 println!("{:<10} {:<36} {}  [{}]", format!("{:?}", r.kind), r.name, r.status, r.id);
             }
         }
-        Some("--demo") if cfg!(debug_assertions) => {
-            widget::DEMO.store(true, std::sync::atomic::Ordering::Relaxed);
+        Some(flag @ ("--demo" | "--demo-warn")) if cfg!(debug_assertions) => {
+            widget::DEMO.store(if flag == "--demo" { 1 } else { 2 }, std::sync::atomic::Ordering::Relaxed);
             widget::run();
         }
         _ => widget::run(),

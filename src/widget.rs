@@ -1,15 +1,16 @@
 //! Window plumbing.
 //!
-//! - A hidden top-level "controller" window receives broadcasts (TaskbarCreated after an
-//!   Explorer restart, theme changes, device changes), owns the timer and the context menu.
-//! - The visible "widget" is a layered child window of the taskbar (Shell_TrayWnd), placed
-//!   just left of the notification area. It dies with Explorer and gets recreated.
+//! - A hidden "controller" window owns the message loop, the tray icon and the context
+//!   menu, and receives broadcasts (TaskbarCreated after an Explorer restart, theme
+//!   changes, device changes).
+//! - The tray icon (tray.rs) is the only always-visible surface. Left-click opens the
+//!   popup (popup.rs) listing every device; right-click opens the menu.
 //! - A worker thread scans devices and posts WM_APP_UPDATE to the controller.
 
 use crate::device::{Reading, Status, Tracker};
-use crate::{bluetooth, delux, diag, headsetcontrol, init_com, logitech, notify, playstation, render, settings, wide, xbox};
+use crate::{bluetooth, delux, diag, headsetcontrol, init_com, logitech, mchose, notify, playstation, popup, settings, tray, wide, xbox};
 use std::cell::RefCell;
-use std::mem::{size_of, zeroed};
+use std::mem::zeroed;
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
@@ -19,13 +20,12 @@ use windows_sys::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, O
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, SetProcessWorkingSetSize};
-use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const WM_APP_UPDATE: u32 = WM_APP + 1;
 const WM_APP_MENU: u32 = WM_APP + 2;
-const TIMER_PLACE: usize = 1;
+const TIMER_ENSURE: usize = 1;
 const CMD_REFRESH: usize = 1;
 const CMD_AUTOSTART: usize = 2;
 const CMD_EXIT: usize = 3;
@@ -35,36 +35,36 @@ const CMD_COPY_DIAGNOSTICS: usize = 5;
 const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
 const CMD_DEVICE_BASE: usize = 100;
 
-/// HID++ is cheap to poll. Bluetooth reads wake the device's radio and HeadsetControl spawns
-/// a process, so poll those less often.
-const POLL_LOGITECH: Duration = Duration::from_secs(15);
+/// HID++ and the vendor protocols are cheap to poll. Bluetooth reads wake the device's
+/// radio and HeadsetControl spawns a process, so poll those less often.
+const POLL_FAST: Duration = Duration::from_secs(15);
 const POLL_BLUETOOTH: Duration = Duration::from_secs(60);
+/// Periodic icon re-add in case Explorer died without a TaskbarCreated broadcast.
+const ENSURE: Duration = Duration::from_secs(60);
 
 static READINGS: Mutex<Option<Vec<Reading>>> = Mutex::new(None);
 static WAKE: OnceLock<Sender<()>> = OnceLock::new();
 
 struct App {
     controller: HWND,
-    widget: HWND,
-    tooltip: HWND,
+    popup: HWND,
+    icon: HICON,
+    state: tray::IconState,
+    warnings: tray::Warnings,
     taskbar_created: u32,
     light: bool,
-    /// Rendered widget size; (0, 0) when there is nothing to show.
-    size: (i32, i32),
-    /// Taskbar layout the current bitmap was rendered for.
-    layout: Option<render::Layout>,
 }
 
 thread_local! {
     static APP: RefCell<App> = const {
         RefCell::new(App {
             controller: null_mut(),
-            widget: null_mut(),
-            tooltip: null_mut(),
+            popup: null_mut(),
+            icon: null_mut(),
+            state: tray::IconState::Normal,
+            warnings: tray::Warnings::new(),
             taskbar_created: 0,
             light: false,
-            size: (0, 0),
-            layout: None,
         })
     };
 }
@@ -72,6 +72,15 @@ thread_local! {
 /// Short borrows only; never hold one across a Win32 call that can dispatch messages.
 fn with<R>(f: impl FnOnce(&mut App) -> R) -> R {
     APP.with(|a| f(&mut a.borrow_mut()))
+}
+
+/// Latest scan results, for the popup and the tooltip.
+pub(crate) fn readings() -> Vec<Reading> {
+    READINGS.lock().unwrap().clone().unwrap_or_default()
+}
+
+pub(crate) fn light_theme() -> bool {
+    with(|a| a.light)
 }
 
 pub fn run() {
@@ -88,8 +97,7 @@ pub fn run() {
 
         let hinst = GetModuleHandleW(null());
         let ctrl_class = wide("TaskbarBatteryController");
-        register(hinst, &ctrl_class, controller_proc);
-        register(hinst, &wide("TaskbarBatteryWidget"), widget_proc);
+        register(hinst, &ctrl_class);
 
         let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
         let controller = CreateWindowExW(
@@ -103,19 +111,24 @@ pub fn run() {
             hinst,
             null(),
         );
+        let light = settings::light_theme();
+        let icon = tray::make_icon(tray::IconState::Normal, tray::icon_size(), light);
+        let popup_wnd = popup::create(hinst);
         with(|a| {
             a.controller = controller;
+            a.popup = popup_wnd;
+            a.icon = icon;
             a.taskbar_created = taskbar_created;
-            a.light = settings::light_theme();
+            a.light = light;
         });
+        tray::add(controller, icon, &tray::tooltip(&[], &[]));
 
         let (tx, rx) = mpsc::channel();
         let _ = WAKE.set(tx);
         let controller_addr = controller as usize;
         std::thread::spawn(move || worker(controller_addr, rx));
 
-        ensure_widget();
-        SetTimer(controller, TIMER_PLACE, 1000, None);
+        SetTimer(controller, TIMER_ENSURE, ENSURE.as_millis() as u32, None);
 
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -125,10 +138,10 @@ pub fn run() {
     }
 }
 
-unsafe fn register(hinst: HINSTANCE, class: &[u16], proc_: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT) {
+unsafe fn register(hinst: HINSTANCE, class: &[u16]) {
     let wc = WNDCLASSW {
         style: 0,
-        lpfnWndProc: Some(proc_),
+        lpfnWndProc: Some(controller_proc),
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: hinst,
@@ -141,11 +154,13 @@ unsafe fn register(hinst: HINSTANCE, class: &[u16], proc_: unsafe extern "system
     RegisterClassW(&wc);
 }
 
-/// Debug builds: `--demo` shows fixed fake readings covering every visual state.
-pub static DEMO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Debug builds: `--demo` shows fake readings covering every visual state
+/// (1 = critical, 2 = warn band).
+pub static DEMO: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 fn demo_readings() -> Vec<Reading> {
     use crate::device::Kind;
+    let warn_only = DEMO.load(std::sync::atomic::Ordering::Relaxed) == 2;
     let r = |name: &str, kind, percent, charging, stale| Reading {
         id: name.into(),
         name: name.into(),
@@ -153,15 +168,15 @@ fn demo_readings() -> Vec<Reading> {
         status: Status::Battery { percent, charging, stale },
     };
     vec![
-        r("Headset", Kind::Headset, 64, true, false),
-        r("Earbuds", Kind::Earbuds, 12, false, false),
-        r("Mouse", Kind::Mouse, 87, false, true),
+        r("Headset", crate::device::Kind::Headset, 64, true, false),
+        r("Earbuds", Kind::Earbuds, if warn_only { 15 } else { 8 }, false, false),
+        r("Mouse", Kind::Mouse, if warn_only { 18 } else { 87 }, false, true),
         r("Keyboard", Kind::Keyboard, 45, false, false),
     ]
 }
 
 fn worker(controller: usize, rx: Receiver<()>) {
-    if DEMO.load(std::sync::atomic::Ordering::Relaxed) {
+    if DEMO.load(std::sync::atomic::Ordering::Relaxed) != 0 {
         *READINGS.lock().unwrap() = Some(demo_readings());
         unsafe { PostMessageW(controller as HWND, WM_APP_UPDATE, 0, 0) };
         return;
@@ -188,6 +203,7 @@ fn worker(controller: usize, rx: Receiver<()>) {
         obs.extend(playstation::scan(&api));
         obs.extend(delux.scan(&api));
         obs.extend(xbox::scan());
+        obs.extend(mchose::scan(&api));
         if forced || last_bt.is_none_or(|t| t.elapsed() >= POLL_BLUETOOTH) {
             bt = bluetooth::scan();
             if let Some(exe) = headsetcontrol::find() {
@@ -203,7 +219,7 @@ fn worker(controller: usize, rx: Receiver<()>) {
         unsafe { PostMessageW(controller as HWND, WM_APP_UPDATE, 0, 0) };
         trim_working_set();
 
-        forced = match rx.recv_timeout(POLL_LOGITECH) {
+        forced = match rx.recv_timeout(POLL_FAST) {
             Ok(()) => {
                 // Device changes come in bursts; let things settle, then scan once.
                 std::thread::sleep(Duration::from_millis(1500));
@@ -228,180 +244,27 @@ fn wake() {
     }
 }
 
-fn readings() -> Vec<Reading> {
-    READINGS.lock().unwrap().clone().unwrap_or_default()
-}
-
-unsafe fn find_tray() -> HWND {
-    FindWindowW(wide("Shell_TrayWnd").as_ptr(), null())
-}
-
-unsafe fn ensure_widget() {
-    let widget = with(|a| a.widget);
-    if !widget.is_null() && IsWindow(widget) != 0 {
-        return;
-    }
-    let tray = find_tray();
-    if tray.is_null() {
-        return; // Explorer not up yet; the timer retries.
-    }
-    let class = wide("TaskbarBatteryWidget");
-    let w = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        class.as_ptr(),
-        null(),
-        WS_CHILD | WS_CLIPSIBLINGS,
-        0, 0, 1, 1,
-        tray,
-        null_mut(),
-        GetModuleHandleW(null()),
-        null(),
-    );
-    let (controller, old_tip) = with(|a| (a.controller, a.tooltip));
-    if !old_tip.is_null() {
-        DestroyWindow(old_tip); // its tool was the previous (dead) widget
-    }
-    let tip = create_tooltip(controller, w);
-    with(|a| {
-        a.widget = w;
-        a.tooltip = tip;
-        a.size = (0, 0);
-        a.layout = None;
-    });
-    redraw();
-}
-
-/// Hover tooltip listing each device's full name and status.
-unsafe fn create_tooltip(owner: HWND, widget: HWND) -> HWND {
-    let icc = INITCOMMONCONTROLSEX { dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_WIN95_CLASSES };
-    InitCommonControlsEx(&icc);
-    let tip = CreateWindowExW(
-        WS_EX_TOPMOST,
-        wide("tooltips_class32").as_ptr(),
-        null(),
-        WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
-        CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-        owner,
-        null_mut(),
-        GetModuleHandleW(null()),
-        null(),
-    );
-    if tip.is_null() {
-        return tip;
-    }
-    let mut text = wide("");
-    let mut ti = tool_info(widget, owner, &mut text);
-    SendMessageW(tip, TTM_ADDTOOLW, 0, &mut ti as *mut _ as LPARAM);
-    SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, 600); // enables multi-line text
-    tip
-}
-
-unsafe fn tool_info(widget: HWND, owner: HWND, text: &mut [u16]) -> TTTOOLINFOW {
-    let mut ti: TTTOOLINFOW = zeroed();
-    ti.cbSize = size_of::<TTTOOLINFOW>() as u32;
-    ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
-    ti.hwnd = owner;
-    ti.uId = widget as usize;
-    ti.lpszText = text.as_mut_ptr();
-    ti
-}
-
-unsafe fn set_tooltip_text(lines: &[String]) {
-    let (tip, widget, controller) = with(|a| (a.tooltip, a.widget, a.controller));
-    if tip.is_null() {
-        return;
-    }
-    let mut text = wide(&lines.join("\r\n"));
-    let ti = tool_info(widget, controller, &mut text);
-    SendMessageW(tip, TTM_UPDATETIPTEXTW, 0, &ti as *const _ as LPARAM);
-}
-
-unsafe fn redraw() {
-    let (widget, light) = with(|a| (a.widget, a.light));
-    if widget.is_null() || IsWindow(widget) == 0 {
-        return;
-    }
-    let tray = find_tray();
-    if tray.is_null() {
-        return;
-    }
-    let layout = taskbar_layout(tray);
-    let dpi = GetDpiForWindow(tray).max(96);
+/// New scan results (or a theme/visibility change): refresh icon, tooltip and popup.
+unsafe fn update() {
+    let rs = readings();
     let hidden = settings::hidden_devices();
-    // Disconnected devices drop off the bar (they stay listed in the right-click menu).
-    let shown: Vec<_> = readings()
-        .into_iter()
-        .filter(|r| !hidden.contains(&r.id) && r.status != Status::NotConnected)
-        .collect();
-    set_tooltip_text(&shown.iter().map(|r| format!("{}: {}", r.name, r.status)).collect::<Vec<_>>());
-    let items: Vec<_> = shown.iter().map(|r| (r.kind, r.status)).collect();
-    let size = if items.is_empty() { (0, 0) } else { render::draw(widget, &items, dpi, layout, light) };
     with(|a| {
-        a.size = size;
-        a.layout = Some(layout);
+        let state = a.warnings.update(&rs, &hidden);
+        let tip = tray::tooltip(&rs, &hidden);
+        // Rebuild the icon only when what it shows changed (state, kind, theme).
+        if state != a.state || a.icon.is_null() {
+            let icon = tray::make_icon(state, tray::icon_size(), a.light);
+            if !icon.is_null() {
+                if !a.icon.is_null() {
+                    DestroyIcon(a.icon);
+                }
+                a.icon = icon;
+                a.state = state;
+            }
+        }
+        tray::update(a.controller, a.icon, &tip);
+        popup::refresh(a.popup);
     });
-    place();
-}
-
-/// A taskbar docked left/right is taller than wide; lay the widget out as a column there.
-unsafe fn taskbar_layout(tray: HWND) -> render::Layout {
-    let mut tr: RECT = zeroed();
-    GetWindowRect(tray, &mut tr);
-    let (w, h) = (tr.right - tr.left, tr.bottom - tr.top);
-    if h > w {
-        render::Layout::Column { width: w }
-    } else {
-        render::Layout::Row { height: h }
-    }
-}
-
-/// Keeps the widget next to the notification area (left of it on a horizontal taskbar, above
-/// it on a vertical one) and above the taskbar's XAML content.
-unsafe fn place() {
-    let (widget, (width, height), rendered) = with(|a| (a.widget, a.size, a.layout));
-    if widget.is_null() || IsWindow(widget) == 0 {
-        return;
-    }
-    let tray = find_tray();
-    if tray.is_null() {
-        return;
-    }
-    // Taskbar moved to another edge or resized: the bitmap was drawn for the old shape.
-    if rendered != Some(taskbar_layout(tray)) {
-        redraw(); // sets the new layout, then calls back here
-        return;
-    }
-    if width == 0 {
-        ShowWindow(widget, SW_HIDE); // nothing to show
-        return;
-    }
-    let mut tr: RECT = zeroed();
-    GetWindowRect(tray, &mut tr);
-    let mut nr: RECT = zeroed();
-    let notify = FindWindowExW(tray, null_mut(), wide("TrayNotifyWnd").as_ptr(), null());
-    let has_notify = !notify.is_null() && GetWindowRect(notify, &mut nr) != 0 && nr.right > nr.left;
-    let margin = 4 * GetDpiForWindow(tray).max(96) as i32 / 96;
-    let (x, y) = match rendered {
-        Some(render::Layout::Column { .. }) => {
-            let bottom = if has_notify { nr.top } else { tr.bottom };
-            (0, bottom - tr.top - height - margin)
-        }
-        _ => {
-            let right = if has_notify { nr.left } else { tr.right };
-            (right - tr.left - width - margin, 0)
-        }
-    };
-
-    let mut cur: RECT = zeroed();
-    GetWindowRect(widget, &mut cur);
-    let moved = cur.left - tr.left != x
-        || cur.top - tr.top != y
-        || cur.right - cur.left != width
-        || cur.bottom - cur.top != height;
-    let on_top = GetWindow(tray, GW_CHILD) == widget;
-    if moved || !on_top || IsWindowVisible(widget) == 0 {
-        SetWindowPos(widget, HWND_TOP, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    }
 }
 
 unsafe fn show_menu(hwnd: HWND) {
@@ -447,16 +310,13 @@ unsafe fn show_menu(hwnd: HWND) {
         CMD_ALERTS => settings::set_alerts(!settings::alerts_enabled()),
         CMD_COPY_DIAGNOSTICS => copy_diagnostics(hwnd),
         CMD_EXIT => {
-            let widget = with(|a| a.widget);
-            if !widget.is_null() {
-                DestroyWindow(widget);
-            }
+            tray::remove(hwnd);
             DestroyWindow(hwnd);
         }
         c if c >= CMD_DEVICE_BASE => {
             if let Some(r) = devices.get(c - CMD_DEVICE_BASE) {
                 settings::toggle_hidden(&r.id);
-                redraw();
+                update();
             }
         }
         _ => {}
@@ -504,14 +364,30 @@ unsafe fn set_clipboard(hwnd: HWND, text: &str) -> bool {
 unsafe extern "system" fn controller_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let taskbar_created = with(|a| a.taskbar_created);
     match msg {
-        WM_APP_UPDATE => redraw(),
+        WM_APP_UPDATE => update(),
         WM_TIMER => {
-            ensure_widget();
-            place();
+            // Belt and braces: re-add the icon if Explorer died without TaskbarCreated.
+            with(|a| {
+                if a.icon.is_null() {
+                    a.icon = tray::make_icon(tray::IconState::Normal, tray::icon_size(), a.light);
+                }
+                let rs = readings();
+                let hidden = settings::hidden_devices();
+                tray::add(hwnd, a.icon, &tray::tooltip(&rs, &hidden));
+            });
         }
         WM_SETTINGCHANGE => {
-            with(|a| a.light = settings::light_theme());
-            redraw();
+            let changed = with(|a| std::mem::replace(&mut a.light, settings::light_theme()) != a.light);
+            if changed {
+                // Theme flipped: the icon colors invert too, force a rebuild.
+                with(|a| {
+                    if !a.icon.is_null() {
+                        DestroyIcon(a.icon);
+                        a.icon = null_mut();
+                    }
+                });
+                update();
+            }
         }
         WM_DEVICECHANGE => {
             wake();
@@ -524,25 +400,30 @@ unsafe extern "system" fn controller_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
             return 1;
         }
         WM_APP_MENU => show_menu(hwnd),
-        WM_DESTROY => PostQuitMessage(0),
+        tray::WM_APP_TRAY => {
+            let popup_wnd = with(|a| a.popup);
+            match lp as u32 & 0xFFFF {
+                tray::NIN_SELECT | tray::NIN_KEYSELECT => popup::toggle(popup_wnd),
+                tray::NIN_POPUPOPEN => show_menu(hwnd),
+                _ => {}
+            }
+        }
+        WM_DESTROY => {
+            tray::remove(hwnd);
+            PostQuitMessage(0);
+        }
         m if m == taskbar_created && m != 0 => {
-            // Explorer restarted: the old widget died with the old taskbar.
-            with(|a| a.widget = null_mut());
-            ensure_widget();
+            // Explorer restarted: the icon died with the old taskbar.
+            with(|a| {
+                if a.icon.is_null() {
+                    a.icon = tray::make_icon(tray::IconState::Normal, tray::icon_size(), a.light);
+                }
+                let rs = readings();
+                let hidden = settings::hidden_devices();
+                tray::add(hwnd, a.icon, &tray::tooltip(&rs, &hidden));
+            });
         }
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     }
     0
-}
-
-unsafe extern "system" fn widget_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    match msg {
-        WM_RBUTTONUP => {
-            let controller = with(|a| a.controller);
-            PostMessageW(controller, WM_APP_MENU, 0, 0);
-            0
-        }
-        WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
-        _ => DefWindowProcW(hwnd, msg, wp, lp),
-    }
 }

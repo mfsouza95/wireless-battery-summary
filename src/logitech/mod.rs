@@ -75,11 +75,12 @@ impl Logitech {
     fn probe(&mut self, link: &dyn Hidpp, ep: &Endpoint, index: u8, via_receiver: bool) -> Option<Observation> {
         let id = format!("logi:{:04x}:{}:{:02x}", ep.pid, ep.iface, index);
         let mut result = battery(link, index);
-        if via_receiver && !self.identities.contains_key(&id) {
+        if via_receiver {
             // A sleeping device times out on the first request but starts waking up from it.
-            // Give it a moment and retry so it gets discovered. Known devices aren't woken
-            // (it costs them battery); they keep their last reading instead.
-            for _ in 0..2 {
+            // New devices get two retries so they can be discovered; known ones get one,
+            // which also covers queries dropped while the device's radio is busy (motion).
+            let retries = if self.identities.contains_key(&id) { 1 } else { 2 };
+            for _ in 0..retries {
                 if !matches!(result, Err(Error::Timeout)) {
                     break;
                 }
