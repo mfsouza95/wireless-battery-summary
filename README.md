@@ -4,6 +4,8 @@
 
 A fork of [windows-taskbar-battery](https://github.com/renanleonel/windows-taskbar-battery) by Renan Leonel, reworked from a per-device taskbar widget into a single notification-area icon with a flyout. The binary is still `taskbar-battery.exe`.
 
+![The popup: one row per device with icon, name, percentage and bar](docs/popup-menu.png)
+
 - **Automatic:** detects Logitech wireless devices, Bluetooth devices, and Xbox/PlayStation controllers on its own, with nothing to configure.
 - **Lightweight:** a single ~600 KB executable written in Rust. It uses only a few MB of memory, has no installer or runtime dependencies (not even the Visual C++ runtime), and sits idle between checks.
 - **Accurate:** for Logitech devices that report a voltage, it uses G HUB's own battery curves (when G HUB is installed), so the percentages match what G HUB shows.
@@ -119,6 +121,18 @@ Right-click the tray icon to see:
 - **Start with Windows:** turn launching at login on or off. It's on by default.
 - **Copy diagnostics:** puts the diagnostics log on the clipboard, for device reports.
 - **Exit**
+
+### The taskbar strip
+
+Prefer the upstream look — every device's icon and percentage sitting directly in the taskbar? Right-click → **Display → Device strip (taskbar)**:
+
+![The strip: device icon and percentage, side by side](docs/screenshot.png)
+
+It shows the charging bolt, dimmed levels for sleeping devices, and red when a battery runs low:
+
+![The strip in its states: charging, low battery, asleep](docs/states.png)
+
+The strip relies on undocumented taskbar internals, so a Windows update can break its placement — that's why the tray icon is the default. Right-clicking the strip opens the same menu.
 
 ### How often it updates
 
