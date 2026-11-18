@@ -8,7 +8,7 @@
 //! - A worker thread scans devices and posts WM_APP_UPDATE to the controller.
 
 use crate::device::{Reading, Status, Tracker};
-use crate::{bluetooth, delux, diag, headsetcontrol, init_com, logitech, mchose, notify, playstation, popup, settings, tray, wide, xbox};
+use crate::{bluetooth, delux, diag, headsetcontrol, init_com, logitech, mchose, notify, playstation, popup, settings, strip, tray, wide, xbox};
 use std::cell::RefCell;
 use std::mem::zeroed;
 use std::ptr::{null, null_mut};
@@ -31,6 +31,8 @@ const CMD_AUTOSTART: usize = 2;
 const CMD_EXIT: usize = 3;
 const CMD_ALERTS: usize = 4;
 const CMD_COPY_DIAGNOSTICS: usize = 5;
+const CMD_MODE_TRAY: usize = 6;
+const CMD_MODE_STRIP: usize = 7;
 /// WM_POWERBROADCAST: resumed from sleep/hibernate.
 const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
 const CMD_DEVICE_BASE: usize = 100;
@@ -53,6 +55,7 @@ struct App {
     warnings: tray::Warnings,
     taskbar_created: u32,
     light: bool,
+    mode: settings::Display,
 }
 
 thread_local! {
@@ -65,6 +68,7 @@ thread_local! {
             warnings: tray::Warnings::new(),
             taskbar_created: 0,
             light: false,
+            mode: settings::Display::Tray,
         })
     };
 }
@@ -83,6 +87,11 @@ pub(crate) fn light_theme() -> bool {
     with(|a| a.light)
 }
 
+/// The controller window: popup/strip child surfaces post their menu messages here.
+pub(crate) fn controller() -> HWND {
+    with(|a| a.controller)
+}
+
 pub fn run() {
     unsafe {
         let mutex_name = wide(r"Local\taskbar-battery");
@@ -98,6 +107,7 @@ pub fn run() {
         let hinst = GetModuleHandleW(null());
         let ctrl_class = wide("TaskbarBatteryController");
         register(hinst, &ctrl_class);
+        strip::register(hinst);
 
         let taskbar_created = RegisterWindowMessageW(wide("TaskbarCreated").as_ptr());
         let controller = CreateWindowExW(
@@ -112,6 +122,7 @@ pub fn run() {
             null(),
         );
         let light = settings::light_theme();
+        let mode = settings::display_mode();
         let icon = tray::make_icon(tray::IconState::Normal, tray::icon_size(), light);
         let popup_wnd = popup::create(hinst);
         with(|a| {
@@ -120,8 +131,12 @@ pub fn run() {
             a.icon = icon;
             a.taskbar_created = taskbar_created;
             a.light = light;
+            a.mode = mode;
         });
-        tray::add(controller, icon, &tray::tooltip(&[], &[]));
+        match mode {
+            settings::Display::Tray => tray::add(controller, icon, &tray::tooltip(&[], &[])),
+            settings::Display::Strip => strip::show(controller),
+        }
 
         let (tx, rx) = mpsc::channel();
         let _ = WAKE.set(tx);
@@ -244,10 +259,15 @@ fn wake() {
     }
 }
 
-/// New scan results (or a theme/visibility change): refresh icon, tooltip and popup.
+/// New scan results (or a theme/visibility change): refresh icon, tooltip and popup —
+/// or the taskbar strip when that's the active display mode.
 unsafe fn update() {
     let rs = readings();
     let hidden = settings::hidden_devices();
+    if with(|a| a.mode) == settings::Display::Strip {
+        strip::redraw(controller());
+        return;
+    }
     with(|a| {
         let state = a.warnings.update(&rs, &hidden);
         let tip = tray::tooltip(&rs, &hidden);
@@ -288,7 +308,15 @@ unsafe fn show_menu(hwnd: HWND) {
     let (refresh, autostart, exit) = (wide("Refresh now"), wide("Start with Windows"), wide("Exit"));
     let alerts = wide("Low battery alerts");
     let copy_label = wide("Copy diagnostics");
+    let (display, tray_label, strip_label) = (wide("Display"), wide("Tray icon"), wide("Device strip (taskbar)"));
     let checked = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
+    // Display submenu: the tray icon+popup or the per-device taskbar strip.
+    let mode = with(|a| a.mode);
+    let sub = CreatePopupMenu();
+    AppendMenuW(sub, MF_STRING | checked(mode == settings::Display::Tray), CMD_MODE_TRAY, tray_label.as_ptr());
+    AppendMenuW(sub, MF_STRING | checked(mode == settings::Display::Strip), CMD_MODE_STRIP, strip_label.as_ptr());
+    AppendMenuW(menu, MF_POPUP, sub as usize, display.as_ptr());
+    labels.extend([display, tray_label, strip_label]);
     AppendMenuW(menu, MF_STRING, CMD_REFRESH, refresh.as_ptr());
     AppendMenuW(menu, MF_STRING | checked(settings::alerts_enabled()), CMD_ALERTS, alerts.as_ptr());
     AppendMenuW(menu, MF_STRING | checked(settings::autostart_enabled()), CMD_AUTOSTART, autostart.as_ptr());
@@ -309,7 +337,10 @@ unsafe fn show_menu(hwnd: HWND) {
         CMD_AUTOSTART => settings::set_autostart(!settings::autostart_enabled()),
         CMD_ALERTS => settings::set_alerts(!settings::alerts_enabled()),
         CMD_COPY_DIAGNOSTICS => copy_diagnostics(hwnd),
+        CMD_MODE_TRAY => set_mode(hwnd, settings::Display::Tray),
+        CMD_MODE_STRIP => set_mode(hwnd, settings::Display::Strip),
         CMD_EXIT => {
+            strip::remove();
             tray::remove(hwnd);
             DestroyWindow(hwnd);
         }
@@ -321,6 +352,26 @@ unsafe fn show_menu(hwnd: HWND) {
         }
         _ => {}
     }
+}
+
+/// Switches between the tray icon (+ popup) and the taskbar strip, live.
+unsafe fn set_mode(hwnd: HWND, mode: settings::Display) {
+    if with(|a| std::mem::replace(&mut a.mode, mode)) == mode {
+        return;
+    }
+    settings::set_display_mode(mode);
+    match mode {
+        settings::Display::Strip => {
+            tray::remove(hwnd);
+            strip::show(hwnd);
+        }
+        settings::Display::Tray => {
+            strip::remove();
+            let tip = tray::tooltip(&readings(), &settings::hidden_devices());
+            with(|a| tray::add(hwnd, a.icon, &tip));
+        }
+    }
+    update();
 }
 
 /// Puts the diagnostics log on the clipboard and confirms with a toast.
@@ -366,15 +417,19 @@ unsafe extern "system" fn controller_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
     match msg {
         WM_APP_UPDATE => update(),
         WM_TIMER => {
-            // Belt and braces: re-add the icon if Explorer died without TaskbarCreated.
-            with(|a| {
-                if a.icon.is_null() {
-                    a.icon = tray::make_icon(tray::IconState::Normal, tray::icon_size(), a.light);
-                }
-                let rs = readings();
-                let hidden = settings::hidden_devices();
-                tray::add(hwnd, a.icon, &tray::tooltip(&rs, &hidden));
-            });
+            // Belt and braces: re-add the icon/strip if Explorer died without TaskbarCreated.
+            if with(|a| a.mode) == settings::Display::Strip {
+                strip::tick(hwnd);
+            } else {
+                with(|a| {
+                    if a.icon.is_null() {
+                        a.icon = tray::make_icon(tray::IconState::Normal, tray::icon_size(), a.light);
+                    }
+                    let rs = readings();
+                    let hidden = settings::hidden_devices();
+                    tray::add(hwnd, a.icon, &tray::tooltip(&rs, &hidden));
+                });
+            }
         }
         WM_SETTINGCHANGE => {
             let changed = with(|a| std::mem::replace(&mut a.light, settings::light_theme()) != a.light);
@@ -404,24 +459,31 @@ unsafe extern "system" fn controller_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
             let popup_wnd = with(|a| a.popup);
             match lp as u32 & 0xFFFF {
                 tray::NIN_SELECT | tray::NIN_KEYSELECT => popup::toggle(popup_wnd),
-                tray::NIN_POPUPOPEN => show_menu(hwnd),
+                // Right-click: v4 delivers WM_CONTEXTMENU, older versions WM_RBUTTONUP.
+                WM_CONTEXTMENU | WM_RBUTTONUP => show_menu(hwnd),
                 _ => {}
             }
         }
         WM_DESTROY => {
+            strip::remove();
             tray::remove(hwnd);
             PostQuitMessage(0);
         }
         m if m == taskbar_created && m != 0 => {
-            // Explorer restarted: the icon died with the old taskbar.
-            with(|a| {
-                if a.icon.is_null() {
-                    a.icon = tray::make_icon(tray::IconState::Normal, tray::icon_size(), a.light);
-                }
-                let rs = readings();
-                let hidden = settings::hidden_devices();
-                tray::add(hwnd, a.icon, &tray::tooltip(&rs, &hidden));
-            });
+            // Explorer restarted: the icon/strip died with the old taskbar.
+            if with(|a| a.mode) == settings::Display::Strip {
+                strip::forget();
+                strip::show(hwnd);
+            } else {
+                with(|a| {
+                    if a.icon.is_null() {
+                        a.icon = tray::make_icon(tray::IconState::Normal, tray::icon_size(), a.light);
+                    }
+                    let rs = readings();
+                    let hidden = settings::hidden_devices();
+                    tray::add(hwnd, a.icon, &tray::tooltip(&rs, &hidden));
+                });
+            }
         }
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     }

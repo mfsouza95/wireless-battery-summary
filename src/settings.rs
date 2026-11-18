@@ -55,6 +55,25 @@ pub fn set_alerts(on: bool) {
     write_dword(APP_KEY, "LowBatteryAlerts", u32::from(on));
 }
 
+/// How devices are shown: one tray icon with a popup (default) or the per-device
+/// strip embedded in the taskbar (the upstream project's approach).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Display {
+    Tray,
+    Strip,
+}
+
+pub fn display_mode() -> Display {
+    match read_dword(APP_KEY, "DisplayMode") {
+        Some(1) => Display::Strip,
+        _ => Display::Tray,
+    }
+}
+
+pub fn set_display_mode(mode: Display) {
+    write_dword(APP_KEY, "DisplayMode", u32::from(matches!(mode, Display::Strip)));
+}
+
 const NOTIFICATION_ICON: &[u8] = include_bytes!("../assets/icon-64.png");
 
 /// Registers the AppUserModelID so Windows accepts our toast notifications, with our icon

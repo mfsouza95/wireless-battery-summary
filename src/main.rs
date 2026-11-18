@@ -12,6 +12,7 @@ mod playstation;
 mod popup;
 mod render;
 mod settings;
+mod strip;
 mod tray;
 mod widget;
 mod xbox;
